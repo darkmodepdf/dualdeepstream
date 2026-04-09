@@ -1,0 +1,34 @@
+# Dataset
+AbRank_dataset.csv
+
+# Papers
+duadeep paper.txt
+duadeep paper.docx
+
+# Model Checkpoints and Logs
+checkpoints/
+training_log.csv
+
+# MMseqs2 temporary files and output
+antigens.fasta
+ag_clusters*
+mmseqs_tmp/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+
+# Plot images
+*.png
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store

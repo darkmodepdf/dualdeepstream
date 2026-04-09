@@ -1,0 +1,29 @@
+name: dualdeep
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - bioconda
+dependencies:
+  - python=3.10
+  - pytorch=2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - transformers>=4.38
+  - datasets
+  - tokenizers
+  - pandas
+  - "numpy<2"
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - tqdm
+  - mmseqs2
+  - jupyterlab
+  - ipywidgets
+  - pip
+  - pip:
+    - lifelines
+    - fair-esm
