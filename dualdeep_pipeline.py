@@ -17,6 +17,7 @@ from transformers import AutoModel, AutoTokenizer, EsmModel, EsmTokenizer
 import pandas as pd
 import numpy as np
 import os, sys, re, csv, glob, subprocess, json
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from pathlib import Path
 from datetime import datetime
 
@@ -477,13 +478,14 @@ def compute_embeddings(model, loader, device):
             ag_ids = batch["ag_input_ids"].to(device)
             ag_mask = batch["ag_attention_mask"].to(device)
 
-            h_out = model.ab_encoder(input_ids=h_ids, attention_mask=h_mask).last_hidden_state
-            l_out = model.ab_encoder(input_ids=l_ids, attention_mask=l_mask).last_hidden_state
-            ag_out = model.ag_encoder(input_ids=ag_ids, attention_mask=ag_mask).last_hidden_state
+            with torch.cuda.amp.autocast():
+                h_out = model.ab_encoder(input_ids=h_ids, attention_mask=h_mask).last_hidden_state
+                l_out = model.ab_encoder(input_ids=l_ids, attention_mask=l_mask).last_hidden_state
+                ag_out = model.ag_encoder(input_ids=ag_ids, attention_mask=ag_mask).last_hidden_state
 
-            h_pool = model.mean_pool(h_out, h_mask)
-            l_pool = model.mean_pool(l_out, l_mask)
-            ag_pool = model.mean_pool(ag_out, ag_mask)
+                h_pool = model.mean_pool(h_out, h_mask)
+                l_pool = model.mean_pool(l_out, l_mask)
+                ag_pool = model.mean_pool(ag_out, ag_mask)
 
             ab_emb = torch.cat([h_pool, l_pool], dim=-1).cpu().numpy()
             ag_emb = ag_pool.cpu().numpy()
