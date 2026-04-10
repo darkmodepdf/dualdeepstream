@@ -46,8 +46,8 @@ def evaluate(model, loader, device, scaler=None):
 
     # Inverse-transform to original pKd scale for meaningful metrics
     if scaler is not None:
-        preds = scaler.inverse_transform(preds.reshape(-1, 1)).flatten()
-        targets = scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
+        preds = scaler.inverse_transform(preds.reshape(-1, 1)).flatten().astype(np.float32)
+        targets = scaler.inverse_transform(targets.reshape(-1, 1)).flatten().astype(np.float32)
 
     rmse = np.sqrt(mean_squared_error(targets, preds))
     mae = mean_absolute_error(targets, preds)

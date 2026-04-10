@@ -59,6 +59,9 @@ def main():
     test_metrics, test_preds, test_targets, test_clusters = evaluate(
         model, test_loader, device, scaler=pKd_scaler
     )
+    # Ensure float32 for plotting/metrics (prevents float16 linalg errors)
+    test_preds = test_preds.astype(np.float32)
+    test_targets = test_targets.astype(np.float32)
 
     print("\n" + "=" * 65)
     print("              FINAL TEST METRICS (original pKd scale)")
