@@ -25,7 +25,7 @@ class AbAgAffinityDataset(Dataset):
       - cluster_id                               (antigen cluster label, for stratification)
     """
 
-    def __init__(self, df, ab_tokenizer, ag_tokenizer, max_ab_len=512, max_ag_len=512):
+    def __init__(self, df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512):
         """
         Args:
             df: DataFrame with columns Ab_heavy_chain_seq, Ab_light_chain_seq,

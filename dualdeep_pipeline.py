@@ -13,6 +13,7 @@
 # %%
 import torch
 import transformers
+from transformers import AutoModel, AutoTokenizer, EsmModel, EsmTokenizer
 import pandas as pd
 import numpy as np
 import os, sys, re, csv, glob, subprocess, json
@@ -59,6 +60,10 @@ print(f"After Aff_op='=' filter: {len(df):,} rows")
 # 2. Drop rows with missing critical fields
 df = df.dropna(subset=["Ab_heavy_chain_seq", "Ab_light_chain_seq", "Ag_seq", "Affinity_Kd [nM]"])
 print(f"After dropping NaN: {len(df):,} rows")
+
+# Convert Affinity_Kd [nM] to numeric, turning non-parseable values to NaN
+df["Affinity_Kd [nM]"] = pd.to_numeric(df["Affinity_Kd [nM]"], errors='coerce')
+df = df.dropna(subset=["Affinity_Kd [nM]"])
 
 # 3. Filter biologically meaningful Kd range: 1e-3 < Kd < 1e9 nM
 df = df[(df["Affinity_Kd [nM]"] > 1e-3) & (df["Affinity_Kd [nM]"] < 1e9)]
@@ -114,8 +119,21 @@ cluster_prefix = str(DATA_DIR / "ag_clusters")
 tmp_dir = str(DATA_DIR / "mmseqs_tmp")
 os.makedirs(tmp_dir, exist_ok=True)
 
+import shutil
+
+# Attempt to locate mmseqs binary in PATH or Conda env
+mmseqs_path = shutil.which("mmseqs")
+if mmseqs_path is None:
+    # Explicitly check the Conda environment's bin folder
+    mmseqs_path = os.path.join(sys.prefix, "bin", "mmseqs")
+    if not os.path.exists(mmseqs_path):
+        raise FileNotFoundError(
+            f"mmseqs not found in PATH or at {mmseqs_path}. "
+            "Please ensure you installed it via `conda install bioconda::mmseqs2`"
+        )
+
 cmd = [
-    "mmseqs", "easy-cluster",
+    mmseqs_path, "easy-cluster",
     str(fasta_file),
     cluster_prefix,
     tmp_dir,
@@ -217,27 +235,39 @@ print("Decision: KEEP them (rare antigen families are valuable for generalizatio
 # --- Group-aware train/val/test split ---
 # No antigen family may appear in more than one split.
 
-clusters = df["ag_cluster_40"].unique().copy()
-np.random.shuffle(clusters)
+cluster_counts = df.groupby("ag_cluster_40").size().sort_values(ascending=False)
+clusters = cluster_counts.index.tolist()
 
-cluster_counts_dict = df.groupby("ag_cluster_40").size().to_dict()
 total = len(df)
-target_test = 0.10 * total
-target_val = 0.10 * total
+target_train = 0.80 * total
+target_val   = 0.10 * total
+target_test  = 0.10 * total
 
 test_clusters, val_clusters, train_clusters = [], [], []
-test_count, val_count = 0, 0
+test_count, val_count, train_count = 0, 0, 0
 
 for c in clusters:
-    count = cluster_counts_dict[c]
-    if test_count < target_test:
-        test_clusters.append(c)
-        test_count += count
-    elif val_count < target_val:
+    count = cluster_counts[c]
+    
+    # Calculate how far each split is from its target relative to its target size
+    scores = [
+        ((target_train - train_count) / target_train, 0, 'train'),
+        ((target_val - val_count) / target_val, 1, 'val'),
+        ((target_test - test_count) / target_test, 2, 'test')
+    ]
+    # Sort descending by score, tie-break by priority (0=train, 1=val, 2=test)
+    scores.sort(reverse=True, key=lambda x: (x[0], -x[1]))
+    best_split = scores[0][2]
+    
+    if best_split == 'train':
+        train_clusters.append(c)
+        train_count += count
+    elif best_split == 'val':
         val_clusters.append(c)
         val_count += count
     else:
-        train_clusters.append(c)
+        test_clusters.append(c)
+        test_count += count
 
 train_df = df[df["ag_cluster_40"].isin(train_clusters)].copy()
 val_df   = df[df["ag_cluster_40"].isin(val_clusters)].copy()
@@ -404,9 +434,9 @@ print("✓ Tokenizers loaded")
 from dataset import AbAgAffinityDataset
 from torch.utils.data import DataLoader
 
-train_dataset = AbAgAffinityDataset(train_df, ab_tokenizer, ag_tokenizer, max_ab_len=512, max_ag_len=512)
-val_dataset   = AbAgAffinityDataset(val_df,   ab_tokenizer, ag_tokenizer, max_ab_len=512, max_ag_len=512)
-test_dataset  = AbAgAffinityDataset(test_df,  ab_tokenizer, ag_tokenizer, max_ab_len=512, max_ag_len=512)
+train_dataset = AbAgAffinityDataset(train_df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
+val_dataset   = AbAgAffinityDataset(val_df,   ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
+test_dataset  = AbAgAffinityDataset(test_df,  ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
 
 train_loader = DataLoader(
     train_dataset, batch_size=32, sampler=sampler,

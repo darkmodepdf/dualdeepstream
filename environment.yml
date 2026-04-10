@@ -10,7 +10,8 @@ dependencies:
   - torchvision
   - torchaudio
   - pytorch-cuda=12.1
-  - transformers>=4.38
+  - transformers>=4.38,<4.45
+  - huggingface_hub<0.24
   - datasets
   - tokenizers
   - pandas
