@@ -53,7 +53,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DualEncoderModel().to(device)
     
-    load_latest_checkpoint(model, None, None, CKPT_DIR)
+    load_latest_checkpoint(model, None, None, None, CKPT_DIR)
 
     # Evaluate with inverse-transform to original pKd scale
     test_metrics, test_preds, test_targets, test_clusters = evaluate(

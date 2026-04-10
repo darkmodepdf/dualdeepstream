@@ -1,0 +1,41 @@
+================================================================================
+                    DUADEEP-SEQAFFINITY PROJECT CONTEXT
+================================================================================
+
+1. PROJECT GOAL
+---------------
+To implement, optimize, and train "DuaDeep-SeqAffinity", a state-of-the-art, sequence-only deep learning framework capable of predicting antibody-antigen binding affinities (pKd) directly from amino acid sequences. The ultimate goal is to enable high-throughput screening of massive therapeutic antibody repertoires, bypassing the expensive and slow 3D structure generation (docking/Alphafold) bottlenecks.
+
+2. CORE IDEAS & ARCHITECTURE (The "Dual-Stream" Concept)
+--------------------------------------------------------
+The model architecture aims to learn both long-range protein fold patterns and fine-grained localized binding hotspot motifs simultaneously without structural biology context.
+* Backbones (Frozen): 
+    - Antibody (Heavy & Light chains encoded separately): AntiBERTa2-CSSP
+    - Antigen: ESM-2 150M.
+* Dual-Stream Extractors (Learnable): For each protein sequence, the frozen embeddings pass through TWO parallel branches:
+    1. Transformer Encoder Branch: Uses Multi-Head Self-Attention to capture GLOBAL contextual dependencies.
+    2. 1D CNN Branch: Uses Convolutional layers to slide across the sequence and capture LOCAL, sequence-specific physicochemical motifs.
+* Fusion & Regression: The globally-pooled Transformer features and locally-pooled CNN features are concatenated and fed into an MLP mapping to a continuous pKd scalar.
+
+3. DESIGN PHILOSOPHY
+--------------------
+* Modular & Readable: Code is separated into logical, single-purpose steps (Preprocessing -> Clustering -> Splitting -> Training -> Evaluation) favoring clarity over clever abstractions.
+* Rigorous Data Hygiene: Implementing strict zero-leakage policies. Antigens are clustered at 40% sequence identity (using MMseqs2), and the dataset is partitioned using a "group-aware" split. No antigen family present in the Train set will ever be seen in the Validation or Test sets.
+* High-Performance & Fault-Tolerant: Engineered for an NVIDIA A100 environment. Uses `torch.cuda.amp` for mixed precision, gradient clipping for stability, and persistent checkpoints (with RNG/Scheduler states saved) to resume training seamlessly upon server interruptions. 
+* Baseline-Driven Validation: The model's complex architecture must strictly outperform a pure Cosine-Similarity Nearest-Neighbor baseline on frozen PLM embeddings. If it doesn't beat the NN Spearman ρ, the deep learning model has failed to learn binding physics and is just doing sequence memorization.
+
+4. PROGRESS MADE
+----------------
+* Explored raw `AbRank_dataset.csv` and aligned the pipeline with the reference paper protocols.
+* Setup Conda environments fixing NumPy 2.x ABI incompatibility crashes and deprecated GPU memory attribute access.
+* Transitioned from a monolithic Jupyter format into a robust Modular Python repository codebase (`step1` through `step5`).
+* Conducted a rigorous codebase audit which identified and fixed two critical deviations from the paper:
+    - Missing dual-stream branches (model originally was just an embedding-concatenation MLP baseline).
+    - Missing pKd z-score standardization (which hurt MSE convergence).
+* Refactored checkpoint logic to explicitly track stateful objects (Numpy Random State, LR-Scheduler) and persist only the absolute best tracking models.
+
+5. IMMEDIATE NEXT STEPS
+-----------------------
+* Execute `step4_train.py` to initiate the training loop on the clustered benchmark data.
+* Monitor the training log metrics (Validation Spearman and RMSE) against the computed NN Baseline embeddings.
+* Proceed to `step5_evaluate.py` to deduce generalization capacity via the per-family calibration breakdown and plots.
