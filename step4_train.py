@@ -81,9 +81,20 @@ def main():
     from scipy.stats import spearmanr
     from sklearn.metrics.pairwise import cosine_similarity
 
-    print("\n--- Computing NN Baseline ---")
-    train_embs, train_targets_np, _ = compute_embeddings(model, train_loader, device)
-    test_embs, test_targets_np, _ = compute_embeddings(model, test_loader, device)
+    emb_file = DATA_DIR / "nn_baseline_embs.npz"
+    if emb_file.exists():
+        print(f"\n--- Loading cached NN Baseline Embeddings from {emb_file.name} ---")
+        data = np.load(emb_file)
+        train_embs = data["train_embs"]
+        train_targets_np = data["train_targets"]
+        test_embs = data["test_embs"]
+        test_targets_np = data["test_targets"]
+    else:
+        print("\n--- Computing NN Baseline ---")
+        train_embs, train_targets_np, _ = compute_embeddings(model, train_loader, device)
+        test_embs, test_targets_np, _ = compute_embeddings(model, test_loader, device)
+        print(f"Saving computed embeddings to {emb_file.name}...")
+        np.savez(emb_file, train_embs=train_embs, train_targets=train_targets_np, test_embs=test_embs, test_targets=test_targets_np)
     
     print("Computing cosine similarities...")
     CHUNK = 1000
@@ -103,7 +114,7 @@ def main():
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
 
     start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, scaler, CKPT_DIR)
 

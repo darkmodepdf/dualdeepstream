@@ -73,7 +73,7 @@ def load_latest_checkpoint(model, optimizer, scaler, ckpt_dir):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scaler is not None:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-    torch.set_rng_state(ckpt["torch_rng_state"])
-    torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+    torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
+    torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
     print(f"  ✓ Resumed from {ckpt_path.name} (epoch {ckpt['epoch']})")
     return ckpt["epoch"], ckpt["best_metric"]
