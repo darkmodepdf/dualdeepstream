@@ -112,8 +112,16 @@ class CNNBranch(nn.Module):
         x = self.dropout(x)
         x = self.relu(self.conv2(x))  # (B, 128, L)
         x = self.dropout(x)
-        x = self.pool(x)  # (B, 128, 1)
-        return x.squeeze(-1)  # (B, 128)
+        # x is (B, 128, L)
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).float()  # (B, 1, L)
+            # Mask out padding just in case conv fields bled into them
+            x = x * mask
+            # Average over valid tokens
+            x = x.sum(dim=2) / mask.sum(dim=2).clamp(min=1e-9)  # (B, 128)
+        else:
+            x = x.mean(dim=2)
+        return x
 
 
 class DualStreamBlock(nn.Module):
@@ -167,34 +175,36 @@ class DualEncoderModel(nn.Module):
         self.ag_encoder.eval()
         self.ag_hidden = self.ag_encoder.config.hidden_size  # 640
 
-        # --- Dual-stream blocks ---
-        # Antibody: operates on concatenated H+L embeddings (1536-d per position)
-        # Since H and L are separate sequences, we pool them first then
-        # use the dual-stream on per-chain embeddings and concat.
-        # Actually, per the paper, each "protein" gets its own dual stream.
-        # We treat the antibody as one entity: H stream + L stream
-        # each getting their own dual-stream, then concat.
-        self.heavy_dualstream = DualStreamBlock(
-            d_model=self.ab_hidden, nhead=nhead,
-            num_transformer_layers=num_transformer_layers, dropout=dropout,
+        # --- Embedding Projection (Align latent spaces) ---
+        self.shared_dim = 512
+        self.ab_proj = nn.Sequential(
+            nn.Linear(self.ab_hidden, self.shared_dim),
+            nn.LayerNorm(self.shared_dim),
+            nn.Dropout(dropout)
         )
-        self.light_dualstream = DualStreamBlock(
-            d_model=self.ab_hidden, nhead=nhead,
+        self.ag_proj = nn.Sequential(
+            nn.Linear(self.ag_hidden, self.shared_dim),
+            nn.LayerNorm(self.shared_dim),
+            nn.Dropout(dropout)
+        )
+
+        # --- Dual-stream blocks ---
+        # The paper specifies ONE dual stream for the Antibody and ONE for the Antigen.
+        # We process Heavy and Light chains separately through the frozen PLM, project
+        # them to the shared hidden dimension, and then concatenate them sequence-wise
+        # before feeding into the single Antibody dual-stream block.
+        self.ab_dualstream = DualStreamBlock(
+            d_model=self.shared_dim, nhead=nhead,
             num_transformer_layers=num_transformer_layers, dropout=dropout,
         )
         self.ag_dualstream = DualStreamBlock(
-            d_model=self.ag_hidden, nhead=nhead,
+            d_model=self.shared_dim, nhead=nhead,
             num_transformer_layers=num_transformer_layers, dropout=dropout,
         )
 
         # Fused dims:
-        #   Heavy: 768 + 128 = 896
-        #   Light: 768 + 128 = 896
-        #   Antigen: 640 + 128 = 768
-        #   Total input to MLP: 896 + 896 + 768 = 2560
-        fused_dim = (self.heavy_dualstream.output_dim +
-                     self.light_dualstream.output_dim +
-                     self.ag_dualstream.output_dim)
+        #   Total input to MLP: (512 + 128) * 2 = 1280
+        fused_dim = self.ab_dualstream.output_dim + self.ag_dualstream.output_dim
 
         # --- MLP Head ---
         layers = []
@@ -234,13 +244,21 @@ class DualEncoderModel(nn.Module):
                 attention_mask=ag_attention_mask
             ).last_hidden_state  # (B, L_ag, 640)
 
+        # Project to shared space
+        h_embs_proj = self.ab_proj(h_embs)  # (B, L_h, self.shared_dim)
+        l_embs_proj = self.ab_proj(l_embs)  # (B, L_l, self.shared_dim)
+        ag_embs_proj = self.ag_proj(ag_embs) # (B, L_ag, self.shared_dim)
+
+        # Unify Antibody Streams (Concat sequence length)
+        ab_embs_proj = torch.cat([h_embs_proj, l_embs_proj], dim=1) # (B, L_h + L_l, self.shared_dim)
+        ab_attention_mask = torch.cat([heavy_attention_mask, light_attention_mask], dim=1) # (B, L_h + L_l)
+
         # Dual-stream feature extraction (LEARNABLE)
-        h_fused = self.heavy_dualstream(h_embs, heavy_attention_mask)    # (B, 896)
-        l_fused = self.light_dualstream(l_embs, light_attention_mask)    # (B, 896)
-        ag_fused = self.ag_dualstream(ag_embs, ag_attention_mask)        # (B, 768)
+        ab_fused = self.ab_dualstream(ab_embs_proj, ab_attention_mask)    
+        ag_fused = self.ag_dualstream(ag_embs_proj, ag_attention_mask)
 
         # Inter-protein fusion
-        fused = torch.cat([h_fused, l_fused, ag_fused], dim=-1)  # (B, 2560)
+        fused = torch.cat([ab_fused, ag_fused], dim=-1)  # (B, 1280)
 
         # Regression
         return self.mlp_head(fused).squeeze(-1)  # (B,)

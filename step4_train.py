@@ -135,14 +135,23 @@ def main():
     print(f"🔑 NN Baseline Spearman ρ: {nn_rho:.4f}")
 
     # --- Training setup ---
-    NUM_EPOCHS = 10
-    LR = 1e-4
+    NUM_EPOCHS = 30
+    LR = 3e-4  # Slightly higher max_lr since we use OneCycleLR warmup
     WEIGHT_DECAY = 1e-4
-    MAX_GRAD_NORM = 1.0
+    MAX_GRAD_NORM = 5.0  # Relaxed from 1.0 to prevent early dead gradients
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR, weight_decay=WEIGHT_DECAY)
     amp_scaler = torch.cuda.amp.GradScaler()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    
+    # We will step scheduler per BATCH
+    total_steps = NUM_EPOCHS * len(train_loader)
+    from torch.optim.lr_scheduler import OneCycleLR
+    scheduler = OneCycleLR(
+        optimizer, max_lr=LR,
+        total_steps=total_steps,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos'
+    )
 
     start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, amp_scaler, scheduler, CKPT_DIR)
 
@@ -187,6 +196,7 @@ def main():
 
             amp_scaler.step(optimizer)
             amp_scaler.update()
+            scheduler.step()  # Step the OneCycleLR per batch
 
             epoch_loss += loss.item()
             n_batches += 1
@@ -195,8 +205,12 @@ def main():
         avg_train_loss = epoch_loss / n_batches
 
         # Validate — metrics computed on original pKd scale (inverse-transformed)
-        val_metrics, _, _, _ = evaluate(model, val_loader, device, scaler=pKd_scaler)
-        scheduler.step(val_metrics["spearman"])
+        val_metrics, val_preds, _, _ = evaluate(model, val_loader, device, scaler=pKd_scaler)
+        
+        # Log learning rate and metrics
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\n  [Epoch {epoch+1} Stats] LR: {current_lr:.2e} | "
+              f"Val Preds: mean={val_preds.mean():.3f}, std={val_preds.std():.3f}")
 
         # Log to CSV
         log_row = {"epoch": epoch + 1, "train_loss": avg_train_loss, **val_metrics}

@@ -14,7 +14,7 @@ def main():
 
     df = pd.read_csv(INPUT_FILE)
     
-    cluster_counts = df.groupby("ag_cluster_40").size().sort_values(ascending=False)
+    cluster_counts = df.groupby("ag_cluster_40").size().sort_values(ascending=True)
     clusters = cluster_counts.index.tolist()
 
     total = len(df)
