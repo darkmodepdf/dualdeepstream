@@ -36,7 +36,7 @@ def evaluate(model, loader, device, scaler=None):
                     ag_input_ids=batch["ag_input_ids"].to(device),
                     ag_attention_mask=batch["ag_attention_mask"].to(device),
                 )
-            all_preds.append(preds.cpu().numpy())
+            all_preds.append(preds.detach().cpu().float().numpy())
             all_targets.append(batch["target"].numpy())
             all_clusters.append(batch["cluster_id"].numpy())
 

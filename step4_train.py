@@ -35,8 +35,8 @@ def compute_embeddings(model, loader, device):
                 l_pool = model.mean_pool(l_out, l_mask)
                 ag_pool = model.mean_pool(ag_out, ag_mask)
 
-            ab_emb = torch.cat([h_pool, l_pool], dim=-1).cpu().numpy()
-            ag_emb = ag_pool.cpu().numpy()
+            ab_emb = torch.cat([h_pool, l_pool], dim=-1).detach().cpu().float().numpy()
+            ag_emb = ag_pool.detach().cpu().float().numpy()
 
             combined = np.concatenate([ab_emb, ag_emb], axis=1)
             all_embs.append(combined)
