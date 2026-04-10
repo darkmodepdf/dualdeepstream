@@ -1,5 +1,8 @@
 import pandas as pd
+import numpy as np
+import joblib
 from pathlib import Path
+from sklearn.preprocessing import StandardScaler
 
 def main():
     print("=== Step 3: Bias Analysis & Group-Aware Splits ===")
@@ -55,6 +58,27 @@ def main():
     assert len(train_fams & val_fams) == 0,  "Leakage: train ∩ val"
     assert len(val_fams & test_fams) == 0,   "Leakage: val ∩ test"
     print("✓ No antigen family leakage between splits")
+
+    # --- pKd z-score standardization (paper §4.1) ---
+    # Fit on TRAINING set only, transform all splits
+    scaler = StandardScaler()
+    train_df["pKd_scaled"] = scaler.fit_transform(train_df[["pKd"]]).flatten()
+    val_df["pKd_scaled"]   = scaler.transform(val_df[["pKd"]]).flatten()
+    test_df["pKd_scaled"]  = scaler.transform(test_df[["pKd"]]).flatten()
+
+    # Save scaler for inference-time inverse transform
+    scaler_path = DATA_DIR / "pKd_scaler.pkl"
+    joblib.dump(scaler, scaler_path)
+    print(f"✓ Saved StandardScaler to {scaler_path}")
+    print(f"  pKd train mean={scaler.mean_[0]:.4f}, std={scaler.scale_[0]:.4f}")
+
+    # Print split summary
+    for name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        n_fam = split_df["ag_cluster_40"].nunique()
+        print(f"{name:5s}: {len(split_df):>7,} samples ({100*len(split_df)/total:5.1f}%), "
+              f"{n_fam} antigen families, "
+              f"pKd mean={split_df['pKd'].mean():.2f}±{split_df['pKd'].std():.2f}, "
+              f"pKd_scaled mean={split_df['pKd_scaled'].mean():.4f}±{split_df['pKd_scaled'].std():.4f}")
 
     train_df.to_csv(DATA_DIR / "train_split.csv", index=False)
     val_df.to_csv(DATA_DIR / "val_split.csv", index=False)

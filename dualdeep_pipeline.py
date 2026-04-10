@@ -1,7 +1,7 @@
 # %% [markdown]
 # # DuaDeep-SeqAffinity: Antibody-Antigen pKd Prediction Pipeline
 #
-# **Architecture:** AntiBERTa2-CSSP (antibody H+L, separate) + ESM-2 150M (antigen) → 256-d projections → MLP → pKd
+# **Architecture:** Dual-stream (Transformer + CNN) on AntiBERTa2-CSSP (H+L) + ESM-2 150M (Ag)
 #
 # **Dataset:** AbRank (~342K rows)
 #
@@ -16,7 +16,7 @@ import transformers
 from transformers import AutoModel, AutoTokenizer, EsmModel, EsmTokenizer
 import pandas as pd
 import numpy as np
-import os, sys, re, csv, glob, subprocess, json
+import os, sys, re, csv, glob, subprocess, json, joblib
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from pathlib import Path
 from datetime import datetime
@@ -125,7 +125,6 @@ import shutil
 # Attempt to locate mmseqs binary in PATH or Conda env
 mmseqs_path = shutil.which("mmseqs")
 if mmseqs_path is None:
-    # Explicitly check the Conda environment's bin folder
     mmseqs_path = os.path.join(sys.prefix, "bin", "mmseqs")
     if not os.path.exists(mmseqs_path):
         raise FileNotFoundError(
@@ -223,10 +222,10 @@ plt.savefig("cluster_distribution.png", dpi=150, bbox_inches='tight')
 plt.show()
 
 # %% [markdown]
-# ## §3 — Bias Analysis & Group-Aware Splits
+# ## §3 — Bias Analysis & Group-Aware Splits + pKd Standardization
 
 # %%
-MIN_CLUSTER_SAMPLES = 5  # threshold for flagging small clusters
+MIN_CLUSTER_SAMPLES = 5
 
 small_clusters = cluster_sample_counts[cluster_sample_counts < MIN_CLUSTER_SAMPLES]
 print(f"Clusters with < {MIN_CLUSTER_SAMPLES} samples: {len(small_clusters)}")
@@ -234,8 +233,6 @@ print("Decision: KEEP them (rare antigen families are valuable for generalizatio
 
 # %%
 # --- Group-aware train/val/test split ---
-# No antigen family may appear in more than one split.
-
 cluster_counts = df.groupby("ag_cluster_40").size().sort_values(ascending=False)
 clusters = cluster_counts.index.tolist()
 
@@ -249,14 +246,11 @@ test_count, val_count, train_count = 0, 0, 0
 
 for c in clusters:
     count = cluster_counts[c]
-    
-    # Calculate how far each split is from its target relative to its target size
     scores = [
         ((target_train - train_count) / target_train, 0, 'train'),
         ((target_val - val_count) / target_val, 1, 'val'),
         ((target_test - test_count) / target_test, 2, 'test')
     ]
-    # Sort descending by score, tie-break by priority (0=train, 1=val, 2=test)
     scores.sort(reverse=True, key=lambda x: (x[0], -x[1]))
     best_split = scores[0][2]
     
@@ -274,18 +268,6 @@ train_df = df[df["ag_cluster_40"].isin(train_clusters)].copy()
 val_df   = df[df["ag_cluster_40"].isin(val_clusters)].copy()
 test_df  = df[df["ag_cluster_40"].isin(test_clusters)].copy()
 
-# Lock test families
-TEST_FAMILIES = set(test_clusters)
-VAL_FAMILIES = set(val_clusters)
-
-print(f"\n--- Split Summary ---")
-for name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
-    n_fam = split_df["ag_cluster_40"].nunique()
-    print(f"{name:5s}: {len(split_df):>7,} samples ({100*len(split_df)/total:5.1f}%), "
-          f"{n_fam} antigen families, "
-          f"pKd mean={split_df['pKd'].mean():.2f}±{split_df['pKd'].std():.2f}")
-
-# %%
 # Verify no leakage
 train_fams = set(train_df["ag_cluster_40"].unique())
 val_fams   = set(val_df["ag_cluster_40"].unique())
@@ -297,18 +279,26 @@ assert len(val_fams & test_fams) == 0,   "❌ Leakage: val ∩ test"
 print("✓ No antigen family leakage between splits")
 
 # %%
-# Per-cluster sample counts after splitting (visible, not hidden)
-print("\n--- Per-Cluster Sample Counts (Train) ---")
-train_cluster_counts = train_df.groupby("ag_cluster_40").size().sort_values(ascending=False)
-print(train_cluster_counts.describe())
+# --- pKd z-score standardization (paper §4.1) ---
+from sklearn.preprocessing import StandardScaler
 
-print("\n--- Per-Cluster Sample Counts (Val) ---")
-val_cluster_counts = val_df.groupby("ag_cluster_40").size().sort_values(ascending=False)
-print(val_cluster_counts.describe())
+pKd_scaler = StandardScaler()
+train_df["pKd_scaled"] = pKd_scaler.fit_transform(train_df[["pKd"]]).flatten()
+val_df["pKd_scaled"]   = pKd_scaler.transform(val_df[["pKd"]]).flatten()
+test_df["pKd_scaled"]  = pKd_scaler.transform(test_df[["pKd"]]).flatten()
 
-print("\n--- Per-Cluster Sample Counts (Test) ---")
-test_cluster_counts = test_df.groupby("ag_cluster_40").size().sort_values(ascending=False)
-print(test_cluster_counts.describe())
+scaler_path = DATA_DIR / "pKd_scaler.pkl"
+joblib.dump(pKd_scaler, scaler_path)
+print(f"✓ pKd StandardScaler: mean={pKd_scaler.mean_[0]:.4f}, std={pKd_scaler.scale_[0]:.4f}")
+
+# %%
+# Print split summary
+print(f"\n--- Split Summary ---")
+for name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+    n_fam = split_df["ag_cluster_40"].nunique()
+    print(f"{name:5s}: {len(split_df):>7,} samples ({100*len(split_df)/total:5.1f}%), "
+          f"{n_fam} antigen families, "
+          f"pKd mean={split_df['pKd'].mean():.2f}±{split_df['pKd'].std():.2f}")
 
 # %%
 # --- WeightedRandomSampler for training ---
@@ -324,100 +314,12 @@ sampler = WeightedRandomSampler(
 print(f"✓ WeightedRandomSampler: {len(train_weights):,} samples, upweighting {len(train_cluster_freq)} families")
 
 # %% [markdown]
-# ## §4 — Model: Dual Encoder + Projection + MLP Head
+# ## §4 — Model: Dual-Stream (Transformer + CNN) Architecture
 
+# %%
 import torch.nn as nn
 import torch.nn.functional as F
-
-class DualEncoderModel(nn.Module):
-    """
-    Dual-encoder model for antibody-antigen pKd prediction.
-
-    Architecture:
-      Heavy chain  → AntiBERTa2-CSSP (frozen) → mean pool → (768,)  ─┐
-                                                                       ├─ concat → (1536,) → proj → (256,)
-      Light chain  → AntiBERTa2-CSSP (frozen) → mean pool → (768,)  ─┘
-      Antigen      → ESM-2 150M (frozen)      → mean pool → (640,)    → proj → (256,)
-
-      Concat(ab_proj, ag_proj) = (512,) → MLP → scalar pKd
-    """
-
-    def __init__(self, ab_model_name="alchemab/antiberta2-cssp",
-                 ag_model_name="facebook/esm2_t30_150M_UR50D",
-                 proj_dim=256, mlp_hidden=None, dropout=0.1):
-        super().__init__()
-        if mlp_hidden is None:
-            mlp_hidden = [512, 256, 128]
-
-        # --- Frozen antibody encoder (shared for H and L) ---
-        self.ab_encoder = AutoModel.from_pretrained(ab_model_name)
-        for p in self.ab_encoder.parameters():
-            p.requires_grad = False
-        self.ab_encoder.eval()
-        ab_hidden = self.ab_encoder.config.hidden_size  # 768
-
-        # --- Frozen antigen encoder ---
-        self.ag_encoder = EsmModel.from_pretrained(ag_model_name)
-        for p in self.ag_encoder.parameters():
-            p.requires_grad = False
-        self.ag_encoder.eval()
-        ag_hidden = self.ag_encoder.config.hidden_size  # 640
-
-        # --- Learned projection layers → 256-d shared space ---
-        self.ab_proj = nn.Sequential(
-            nn.Linear(ab_hidden * 2, proj_dim),  # 1536 → 256
-            nn.ReLU(),
-            nn.LayerNorm(proj_dim),
-        )
-        self.ag_proj = nn.Sequential(
-            nn.Linear(ag_hidden, proj_dim),  # 640 → 256
-            nn.ReLU(),
-            nn.LayerNorm(proj_dim),
-        )
-
-        # --- MLP Head ---
-        layers = []
-        in_dim = proj_dim * 2  # 512
-        for h in mlp_hidden:
-            layers.extend([
-                nn.Linear(in_dim, h),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ])
-            in_dim = h
-        layers.append(nn.Linear(in_dim, 1))
-        self.mlp_head = nn.Sequential(*layers)
-
-    def mean_pool(self, last_hidden_state, attention_mask):
-        mask = attention_mask.unsqueeze(-1).float()
-        return (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-
-    def forward(self, heavy_input_ids, heavy_attention_mask,
-                light_input_ids, light_attention_mask,
-                ag_input_ids, ag_attention_mask):
-        # Frozen encoders — no gradient
-        with torch.no_grad():
-            h_out = self.ab_encoder(input_ids=heavy_input_ids,
-                                    attention_mask=heavy_attention_mask).last_hidden_state
-            l_out = self.ab_encoder(input_ids=light_input_ids,
-                                    attention_mask=light_attention_mask).last_hidden_state
-            ag_out = self.ag_encoder(input_ids=ag_input_ids,
-                                     attention_mask=ag_attention_mask).last_hidden_state
-
-        # Mean pooling
-        h_pooled = self.mean_pool(h_out, heavy_attention_mask)   # (B, 768)
-        l_pooled = self.mean_pool(l_out, light_attention_mask)   # (B, 768)
-        ab_pooled = torch.cat([h_pooled, l_pooled], dim=-1)      # (B, 1536)
-        ag_pooled = self.mean_pool(ag_out, ag_attention_mask)     # (B, 640)
-
-        # Projection
-        ab_proj = self.ab_proj(ab_pooled)  # (B, 256)
-        ag_proj = self.ag_proj(ag_pooled)  # (B, 256)
-
-        # Fusion + regression
-        fused = torch.cat([ab_proj, ag_proj], dim=-1)  # (B, 512)
-        return self.mlp_head(fused).squeeze(-1)  # (B,)
-
+from dualdeep_model import DualEncoderModel
 
 # %%
 # Load tokenizers
@@ -430,76 +332,12 @@ print("✓ Tokenizers loaded")
 # ## §5 — Create DataLoaders
 
 # %%
-from torch.utils.data import Dataset, DataLoader
+from dualdeep_dataset import AbAgAffinityDataset
+from torch.utils.data import DataLoader
 
-class AbAgAffinityDataset(Dataset):
-    """
-    Dataset for antibody-antigen binding affinity (pKd) prediction.
-
-    Each sample produces:
-      - heavy_input_ids, heavy_attention_mask   (AntiBERTa2-CSSP tokenized heavy chain)
-      - light_input_ids, light_attention_mask   (AntiBERTa2-CSSP tokenized light chain)
-      - ag_input_ids, ag_attention_mask          (ESM-2 tokenized antigen)
-      - target                                   (pKd float scalar)
-      - cluster_id                               (antigen cluster label, for stratification)
-    """
-
-    def __init__(self, df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512):
-        self.df = df.reset_index(drop=True)
-        self.ab_tokenizer = ab_tokenizer
-        self.ag_tokenizer = ag_tokenizer
-        self.max_ab_len = max_ab_len
-        self.max_ag_len = max_ag_len
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        # --- Antibody: encode heavy and light chains SEPARATELY ---
-        heavy_tokens = self.ab_tokenizer(
-            row["Ab_heavy_chain_seq"],
-            max_length=self.max_ab_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        light_tokens = self.ab_tokenizer(
-            row["Ab_light_chain_seq"],
-            max_length=self.max_ab_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        # --- Antigen ---
-        ag_tokens = self.ag_tokenizer(
-            row["Ag_seq"],
-            max_length=self.max_ag_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        target = torch.tensor(row["pKd"], dtype=torch.float32)
-        cluster_id = torch.tensor(row["ag_cluster_40"], dtype=torch.long)
-
-        return {
-            "heavy_input_ids": heavy_tokens["input_ids"].squeeze(0),
-            "heavy_attention_mask": heavy_tokens["attention_mask"].squeeze(0),
-            "light_input_ids": light_tokens["input_ids"].squeeze(0),
-            "light_attention_mask": light_tokens["attention_mask"].squeeze(0),
-            "ag_input_ids": ag_tokens["input_ids"].squeeze(0),
-            "ag_attention_mask": ag_tokens["attention_mask"].squeeze(0),
-            "target": target,
-            "cluster_id": cluster_id,
-        }
-
-
-train_dataset = AbAgAffinityDataset(train_df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
-val_dataset   = AbAgAffinityDataset(val_df,   ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
-test_dataset  = AbAgAffinityDataset(test_df,  ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
+train_dataset = AbAgAffinityDataset(train_df, ab_tokenizer, ag_tokenizer, target_col="pKd_scaled")
+val_dataset   = AbAgAffinityDataset(val_df,   ab_tokenizer, ag_tokenizer, target_col="pKd_scaled")
+test_dataset  = AbAgAffinityDataset(test_df,  ab_tokenizer, ag_tokenizer, target_col="pKd_scaled")
 
 train_loader = DataLoader(
     train_dataset, batch_size=32, sampler=sampler,
@@ -525,11 +363,12 @@ print(f"Test:  {len(test_dataset):,} samples, {len(test_loader)} batches")
 from scipy.stats import spearmanr
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm.auto import tqdm
+from dualdeep_utils import evaluate, save_checkpoint, load_latest_checkpoint
 
 
 def compute_embeddings(model, loader, device):
     """Extract mean-pooled embeddings from frozen encoders for NN baseline."""
-    all_ab_embs, all_ag_embs, all_targets, all_clusters = [], [], [], []
+    all_embs, all_targets, all_clusters = [], [], []
     model.eval()
     with torch.no_grad():
         for batch in tqdm(loader, desc="Computing embeddings", mininterval=2.0):
@@ -552,29 +391,25 @@ def compute_embeddings(model, loader, device):
             ab_emb = torch.cat([h_pool, l_pool], dim=-1).cpu().numpy()
             ag_emb = ag_pool.cpu().numpy()
 
-            # Concatenate ab+ag for similarity
             combined = np.concatenate([ab_emb, ag_emb], axis=1)
-            all_ab_embs.append(combined)
+            all_embs.append(combined)
             all_targets.append(batch["target"].numpy())
             all_clusters.append(batch["cluster_id"].numpy())
 
-    return (np.concatenate(all_ab_embs),
+    return (np.concatenate(all_embs),
             np.concatenate(all_targets),
             np.concatenate(all_clusters))
 
 
-# This cell runs AFTER model instantiation (§7 preamble)
-# See "NN Baseline Execution" cell below
-
 # %% [markdown]
-# ## §7 — Training (Fault-Tolerant, AMP, CSV Logging)
+# ## §7 — Training (Fault-Tolerant, AMP, Gradient Clipping, CSV Logging)
 
 # %%
 # --- Instantiate model ---
 device = torch.device("cuda")
 model = DualEncoderModel().to(device)
 
-# Only projection + MLP params are trainable
+# Only dual-stream + projection + MLP params are trainable
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 total_params = sum(p.numel() for p in model.parameters())
 frozen_params = total_params - trainable_params
@@ -594,33 +429,42 @@ print(f"    Largest cluster:  {cluster_sample_counts.max():,} samples")
 print(f"    Smallest cluster: {cluster_sample_counts.min():,} samples")
 print(f"    Median cluster:   {int(cluster_sample_counts.median()):,} samples")
 print(f"    Singletons:       {n_singletons}")
+print(f"\n  pKd normalization:")
+print(f"    Scaler mean:  {pKd_scaler.mean_[0]:.4f}")
+print(f"    Scaler scale: {pKd_scaler.scale_[0]:.4f}")
 print(f"\n  Model parameters:")
 print(f"    Total:     {total_params:>12,}")
 print(f"    Trainable: {trainable_params:>12,} ({100*trainable_params/total_params:.2f}%)")
 print(f"    Frozen:    {frozen_params:>12,}")
+print(f"\n  Architecture: Dual-Stream (Transformer + CNN)")
+print(f"    Ab streams: Heavy (768+128=896) + Light (768+128=896)")
+print(f"    Ag stream:  640+128=768")
+print(f"    Fused dim:  2560 → MLP [512, 256, 128] → 1")
 print(f"\n  Hardware:    {torch.cuda.get_device_name(0)}")
 print(f"  Precision:   torch.cuda.amp (float16)")
-print(f"  Optimizer:   AdamW, lr=1e-4, weight_decay=1e-4")
+print(f"  Optimizer:   AdamW, lr=1e-4, weight_decay=1e-4, grad_clip=1.0")
 print("=" * 65)
 
 # %%
 # --- NN Baseline Execution ---
 print("\n--- Computing NN Baseline ---")
-train_embs, train_targets_np, train_clusters_np = compute_embeddings(model, train_loader, device)
-test_embs, test_targets_np, test_clusters_np = compute_embeddings(model, test_loader, device)
+train_embs, train_targets_scaled, train_clusters_np = compute_embeddings(model, train_loader, device)
+test_embs, test_targets_scaled, test_clusters_np = compute_embeddings(model, test_loader, device)
 
-# For each test sample, find most similar training sample
+# Inverse-transform for NN baseline comparison on original pKd scale
+train_targets_raw = pKd_scaler.inverse_transform(train_targets_scaled.reshape(-1, 1)).flatten()
+test_targets_raw = pKd_scaler.inverse_transform(test_targets_scaled.reshape(-1, 1)).flatten()
+
 print("Computing cosine similarities...")
-# Process in chunks to avoid OOM
 CHUNK = 1000
 nn_preds = np.zeros(len(test_embs))
 for i in tqdm(range(0, len(test_embs), CHUNK), desc="NN search", mininterval=2.0):
     chunk = test_embs[i:i+CHUNK]
     sims = cosine_similarity(chunk, train_embs)
     nn_idx = sims.argmax(axis=1)
-    nn_preds[i:i+CHUNK] = train_targets_np[nn_idx]
+    nn_preds[i:i+CHUNK] = train_targets_raw[nn_idx]
 
-nn_rho, _ = spearmanr(test_targets_np, nn_preds)
+nn_rho, _ = spearmanr(test_targets_raw, nn_preds)
 print(f"🔑 NN Baseline Spearman ρ: {nn_rho:.4f}")
 print("   (Model MUST beat this to be considered successful)")
 
@@ -629,105 +473,23 @@ print("   (Model MUST beat this to be considered successful)")
 NUM_EPOCHS = 50
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
+MAX_GRAD_NORM = 1.0
 
 optimizer = torch.optim.AdamW(
     [p for p in model.parameters() if p.requires_grad],
     lr=LR, weight_decay=WEIGHT_DECAY,
 )
-scaler = torch.cuda.amp.GradScaler()
+amp_scaler = torch.cuda.amp.GradScaler()
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.5, patience=5, verbose=True,
 )
 
 # %%
-# --- Checkpoint management ---
-
-def save_checkpoint(model, optimizer, scaler, epoch, metric, ckpt_dir=CKPT_DIR, max_ckpts=2):
-    ckpt_path = ckpt_dir / f"ckpt_epoch{epoch:03d}_spearman{metric:.4f}.pt"
-    torch.save({
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_metric": metric,
-        "torch_rng_state": torch.get_rng_state(),
-        "cuda_rng_state": torch.cuda.get_rng_state(),
-    }, ckpt_path)
-    # Enforce max checkpoints on disk
-    existing = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)
-    while len(existing) > max_ckpts:
-        existing[0].unlink()
-        existing.pop(0)
-    print(f"  💾 Saved checkpoint: {ckpt_path.name}")
-
-
-def load_latest_checkpoint(model, optimizer, scaler, ckpt_dir=CKPT_DIR):
-    ckpts = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)
-    if not ckpts:
-        print("  No checkpoint found — starting from scratch")
-        return 0, -float("inf")
-    ckpt_path = ckpts[-1]
-    ckpt = torch.load(ckpt_path, map_location="cuda", weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scaler.load_state_dict(ckpt["scaler_state_dict"])
-    torch.set_rng_state(ckpt["torch_rng_state"])
-    torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
-    print(f"  ✓ Resumed from {ckpt_path.name} (epoch {ckpt['epoch']}, "
-          f"best Spearman: {ckpt['best_metric']:.4f})")
-    return ckpt["epoch"], ckpt["best_metric"]
-
-# %%
-# --- Evaluation function ---
-from scipy.stats import pearsonr, spearmanr, kendalltau
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from lifelines.utils import concordance_index
-
-
-def evaluate(model, loader, device):
-    """Evaluate on a DataLoader, return dict of all metrics."""
-    model.eval()
-    all_preds, all_targets, all_clusters = [], [], []
-    with torch.no_grad():
-        for batch in loader:
-            with torch.cuda.amp.autocast():
-                preds = model(
-                    heavy_input_ids=batch["heavy_input_ids"].to(device),
-                    heavy_attention_mask=batch["heavy_attention_mask"].to(device),
-                    light_input_ids=batch["light_input_ids"].to(device),
-                    light_attention_mask=batch["light_attention_mask"].to(device),
-                    ag_input_ids=batch["ag_input_ids"].to(device),
-                    ag_attention_mask=batch["ag_attention_mask"].to(device),
-                )
-            all_preds.append(preds.cpu().numpy())
-            all_targets.append(batch["target"].numpy())
-            all_clusters.append(batch["cluster_id"].numpy())
-
-    preds = np.concatenate(all_preds)
-    targets = np.concatenate(all_targets)
-    clusters = np.concatenate(all_clusters)
-
-    rmse = np.sqrt(mean_squared_error(targets, preds))
-    mae = mean_absolute_error(targets, preds)
-    r2 = r2_score(targets, preds)
-    pearson_r, _ = pearsonr(targets, preds)
-    spearman_rho, _ = spearmanr(targets, preds)
-    kendall, _ = kendalltau(targets, preds)
-    ci = concordance_index(targets, preds)
-
-    return {
-        "rmse": rmse,
-        "mae": mae,
-        "r2": r2,
-        "pearson": pearson_r,
-        "spearman": spearman_rho,
-        "kendall_tau": kendall,
-        "ci": ci,
-    }, preds, targets, clusters
+# --- Checkpoint management (imported from dualdeep_utils) ---
 
 # %%
 # --- Training loop ---
-start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, scaler)
+start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, amp_scaler)
 
 for epoch in range(start_epoch, NUM_EPOCHS):
     model.train()
@@ -752,9 +514,17 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             )
             loss = F.mse_loss(preds, batch["target"].to(device))
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        amp_scaler.scale(loss).backward()
+
+        # Gradient clipping for stability
+        amp_scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad],
+            max_norm=MAX_GRAD_NORM,
+        )
+
+        amp_scaler.step(optimizer)
+        amp_scaler.update()
 
         epoch_loss += loss.item()
         n_batches += 1
@@ -762,8 +532,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     avg_train_loss = epoch_loss / n_batches
 
-    # --- Validation ---
-    val_metrics, _, _, _ = evaluate(model, val_loader, device)
+    # --- Validation (metrics on original pKd scale) ---
+    val_metrics, _, _, _ = evaluate(model, val_loader, device, scaler=pKd_scaler)
     scheduler.step(val_metrics["spearman"])
 
     # --- Log to CSV ---
@@ -785,7 +555,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     # --- Checkpoint if improved ---
     if val_metrics["spearman"] > best_spearman:
         best_spearman = val_metrics["spearman"]
-        save_checkpoint(model, optimizer, scaler, epoch + 1, best_spearman)
+        save_checkpoint(model, optimizer, amp_scaler, epoch + 1, best_spearman, CKPT_DIR)
 
 print(f"\n✓ Training complete. Best validation Spearman ρ: {best_spearman:.4f}")
 
@@ -794,12 +564,14 @@ print(f"\n✓ Training complete. Best validation Spearman ρ: {best_spearman:.4f
 
 # %%
 # Load best checkpoint for final evaluation
-_, _ = load_latest_checkpoint(model, optimizer, scaler)
+_, _ = load_latest_checkpoint(model, optimizer, amp_scaler)
 
-test_metrics, test_preds, test_targets, test_clusters = evaluate(model, test_loader, device)
+test_metrics, test_preds, test_targets, test_clusters = evaluate(
+    model, test_loader, device, scaler=pKd_scaler
+)
 
 print("\n" + "=" * 65)
-print("              FINAL TEST METRICS")
+print("              FINAL TEST METRICS (original pKd scale)")
 print("=" * 65)
 for k, v in test_metrics.items():
     print(f"  {k:15s}: {v:.4f}")

@@ -1,11 +1,28 @@
+"""
+dualdeep_utils.py — Shared utilities: evaluation, checkpointing.
+"""
+
 import torch
 import numpy as np
-from tqdm.auto import tqdm
 from scipy.stats import pearsonr, spearmanr, kendalltau
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from lifelines.utils import concordance_index
 
-def evaluate(model, loader, device):
+
+def evaluate(model, loader, device, scaler=None):
+    """
+    Evaluate model on a DataLoader.
+
+    Args:
+        model: DualEncoderModel
+        loader: DataLoader
+        device: torch device
+        scaler: sklearn StandardScaler for pKd. If provided, predictions and
+                targets are inverse-transformed to original pKd scale before
+                computing metrics. If None, metrics are on raw (scaled) values.
+    Returns:
+        metrics_dict, predictions, targets, cluster_ids
+    """
     model.eval()
     all_preds, all_targets, all_clusters = [], [], []
     with torch.no_grad():
@@ -27,6 +44,11 @@ def evaluate(model, loader, device):
     targets = np.concatenate(all_targets)
     clusters = np.concatenate(all_clusters)
 
+    # Inverse-transform to original pKd scale for meaningful metrics
+    if scaler is not None:
+        preds = scaler.inverse_transform(preds.reshape(-1, 1)).flatten()
+        targets = scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
+
     rmse = np.sqrt(mean_squared_error(targets, preds))
     mae = mean_absolute_error(targets, preds)
     r2 = r2_score(targets, preds)
@@ -45,6 +67,7 @@ def evaluate(model, loader, device):
         "ci": ci,
     }, preds, targets, clusters
 
+
 def save_checkpoint(model, optimizer, scaler, epoch, metric, ckpt_dir, max_ckpts=2):
     ckpt_path = ckpt_dir / f"ckpt_epoch{epoch:03d}_spearman{metric:.4f}.pt"
     torch.save({
@@ -60,6 +83,8 @@ def save_checkpoint(model, optimizer, scaler, epoch, metric, ckpt_dir, max_ckpts
     while len(existing) > max_ckpts:
         existing[0].unlink()
         existing.pop(0)
+    print(f"  💾 Saved checkpoint: {ckpt_path.name}")
+
 
 def load_latest_checkpoint(model, optimizer, scaler, ckpt_dir):
     ckpts = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)

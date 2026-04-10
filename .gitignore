@@ -15,6 +15,15 @@ antigens.fasta
 ag_clusters*
 mmseqs_tmp/
 
+# Intermediate pipeline data
+step1_cleaned_dataset.csv
+step2_clustered_dataset.csv
+train_split.csv
+val_split.csv
+test_split.csv
+pKd_scaler.pkl
+nn_baseline_embs.npz
+
 # Virtual Environments
 venv/
 .venv/
@@ -33,3 +42,7 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+dualdeep_pipeline.ipynb

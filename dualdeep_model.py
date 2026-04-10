@@ -1,11 +1,154 @@
+"""
+dualdeep_model.py — DuaDeep-SeqAffinity dual-stream model.
+
+Architecture (per paper §3.1–3.4):
+  Heavy chain  → AntiBERTa2-CSSP (frozen) → mean pool → (768,)  ─┐
+                                                                    ├─ concat → (1536,)
+  Light chain  → AntiBERTa2-CSSP (frozen) → mean pool → (768,)  ─┘
+                          │
+                ┌─────────┴──────────┐
+          TransformerBranch      CNNBranch
+            (1536→1536)         (1536→128)
+                │                    │
+            avg pool              adapt pool
+            (1536,)              (128,)
+                └──── concat ────────┘ = (1664,)  = ab_fused
+
+  Antigen → ESM-2 150M (frozen) → (seq_len, 640)
+                          │
+                ┌─────────┴──────────┐
+          TransformerBranch      CNNBranch
+            (640→640)           (640→128)
+                │                    │
+            avg pool              adapt pool
+            (640,)               (128,)
+                └──── concat ────────┘ = (768,)   = ag_fused
+
+  Concat(ab_fused, ag_fused) → MLP → scalar pKd
+"""
+
 import torch
 import torch.nn as nn
 from transformers import AutoModel, EsmModel
 
+
+class TransformerBranch(nn.Module):
+    """
+    Learnable Transformer encoder branch (paper §3.2.1).
+    Stacked Transformer encoder layers on top of frozen PLM embeddings.
+    Outputs global average pool → fixed-size vector.
+    """
+
+    def __init__(self, d_model, nhead=8, num_layers=2, dim_feedforward=None, dropout=0.1):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="relu",
+            batch_first=True,
+            norm_first=True,  # Pre-LN for training stability
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x, attention_mask=None):
+        """
+        Args:
+            x: (B, L, D) — PLM embeddings
+            attention_mask: (B, L) — 1=real token, 0=pad
+        Returns:
+            (B, D) — global average pooled Transformer output
+        """
+        # TransformerEncoder expects src_key_padding_mask where True=pad
+        if attention_mask is not None:
+            key_padding_mask = (attention_mask == 0)
+        else:
+            key_padding_mask = None
+
+        out = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B, L, D)
+
+        # Global average pooling over non-pad tokens
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()  # (B, L, 1)
+            pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+        else:
+            pooled = out.mean(dim=1)
+        return pooled  # (B, D)
+
+
+class CNNBranch(nn.Module):
+    """
+    1D CNN branch for local motif detection (paper §3.2.2).
+    Conv1d(D_E, 256, kernel=3) → ReLU → Conv1d(256, 128, kernel=5) → ReLU → AdaptiveAvgPool1d(1)
+    Output: (B, 128)
+    """
+
+    def __init__(self, in_channels, dropout=0.1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, 256, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(256, 128, kernel_size=5, padding=2)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, x, attention_mask=None):
+        """
+        Args:
+            x: (B, L, D) — PLM embeddings
+            attention_mask: (B, L) — 1=real token, 0=pad
+        Returns:
+            (B, 128) — locally-aware feature vector
+        """
+        # Mask padding before conv
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).float()
+
+        # Conv1d expects (B, C, L)
+        x = x.transpose(1, 2)  # (B, D, L)
+        x = self.relu(self.conv1(x))  # (B, 256, L)
+        x = self.dropout(x)
+        x = self.relu(self.conv2(x))  # (B, 128, L)
+        x = self.dropout(x)
+        x = self.pool(x)  # (B, 128, 1)
+        return x.squeeze(-1)  # (B, 128)
+
+
+class DualStreamBlock(nn.Module):
+    """
+    Combined Transformer + CNN dual-stream (paper §3.2 + §3.3).
+    Takes PLM embeddings, runs both branches in parallel, concatenates outputs.
+    Output dim = d_model + 128 (Transformer pool + CNN pool).
+    """
+
+    def __init__(self, d_model, nhead=8, num_transformer_layers=2, dropout=0.1):
+        super().__init__()
+        self.transformer_branch = TransformerBranch(
+            d_model=d_model, nhead=nhead,
+            num_layers=num_transformer_layers, dropout=dropout,
+        )
+        self.cnn_branch = CNNBranch(in_channels=d_model, dropout=dropout)
+        self.output_dim = d_model + 128  # Transformer + CNN
+
+    def forward(self, x, attention_mask=None):
+        t_out = self.transformer_branch(x, attention_mask)  # (B, d_model)
+        c_out = self.cnn_branch(x, attention_mask)           # (B, 128)
+        return torch.cat([t_out, c_out], dim=-1)             # (B, d_model + 128)
+
+
 class DualEncoderModel(nn.Module):
+    """
+    Full DuaDeep-SeqAffinity model.
+
+    Frozen PLM encoders → dual-stream (Transformer + CNN) → fusion → MLP → pKd.
+    """
+
     def __init__(self, ab_model_name="alchemab/antiberta2-cssp",
                  ag_model_name="facebook/esm2_t30_150M_UR50D",
-                 proj_dim=256, mlp_hidden=None, dropout=0.1):
+                 nhead=8, num_transformer_layers=2,
+                 mlp_hidden=None, dropout=0.1):
         super().__init__()
         if mlp_hidden is None:
             mlp_hidden = [512, 256, 128]
@@ -15,30 +158,47 @@ class DualEncoderModel(nn.Module):
         for p in self.ab_encoder.parameters():
             p.requires_grad = False
         self.ab_encoder.eval()
-        ab_hidden = self.ab_encoder.config.hidden_size  # 768
+        self.ab_hidden = self.ab_encoder.config.hidden_size  # 768
 
         # --- Frozen antigen encoder ---
         self.ag_encoder = EsmModel.from_pretrained(ag_model_name)
         for p in self.ag_encoder.parameters():
             p.requires_grad = False
         self.ag_encoder.eval()
-        ag_hidden = self.ag_encoder.config.hidden_size  # 640
+        self.ag_hidden = self.ag_encoder.config.hidden_size  # 640
 
-        # --- Learned projection layers ---
-        self.ab_proj = nn.Sequential(
-            nn.Linear(ab_hidden * 2, proj_dim),
-            nn.ReLU(),
-            nn.LayerNorm(proj_dim),
+        # --- Dual-stream blocks ---
+        # Antibody: operates on concatenated H+L embeddings (1536-d per position)
+        # Since H and L are separate sequences, we pool them first then
+        # use the dual-stream on per-chain embeddings and concat.
+        # Actually, per the paper, each "protein" gets its own dual stream.
+        # We treat the antibody as one entity: H stream + L stream
+        # each getting their own dual-stream, then concat.
+        self.heavy_dualstream = DualStreamBlock(
+            d_model=self.ab_hidden, nhead=nhead,
+            num_transformer_layers=num_transformer_layers, dropout=dropout,
         )
-        self.ag_proj = nn.Sequential(
-            nn.Linear(ag_hidden, proj_dim),
-            nn.ReLU(),
-            nn.LayerNorm(proj_dim),
+        self.light_dualstream = DualStreamBlock(
+            d_model=self.ab_hidden, nhead=nhead,
+            num_transformer_layers=num_transformer_layers, dropout=dropout,
         )
+        self.ag_dualstream = DualStreamBlock(
+            d_model=self.ag_hidden, nhead=nhead,
+            num_transformer_layers=num_transformer_layers, dropout=dropout,
+        )
+
+        # Fused dims:
+        #   Heavy: 768 + 128 = 896
+        #   Light: 768 + 128 = 896
+        #   Antigen: 640 + 128 = 768
+        #   Total input to MLP: 896 + 896 + 768 = 2560
+        fused_dim = (self.heavy_dualstream.output_dim +
+                     self.light_dualstream.output_dim +
+                     self.ag_dualstream.output_dim)
 
         # --- MLP Head ---
         layers = []
-        in_dim = proj_dim * 2
+        in_dim = fused_dim
         for h in mlp_hidden:
             layers.extend([
                 nn.Linear(in_dim, h),
@@ -50,27 +210,37 @@ class DualEncoderModel(nn.Module):
         self.mlp_head = nn.Sequential(*layers)
 
     def mean_pool(self, last_hidden_state, attention_mask):
+        """Mean pool over non-pad tokens (used for NN baseline embeddings)."""
         mask = attention_mask.unsqueeze(-1).float()
         return (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
 
     def forward(self, heavy_input_ids, heavy_attention_mask,
                 light_input_ids, light_attention_mask,
                 ag_input_ids, ag_attention_mask):
+        # Frozen encoders — no gradient
         with torch.no_grad():
-            h_out = self.ab_encoder(input_ids=heavy_input_ids,
-                                    attention_mask=heavy_attention_mask).last_hidden_state
-            l_out = self.ab_encoder(input_ids=light_input_ids,
-                                    attention_mask=light_attention_mask).last_hidden_state
-            ag_out = self.ag_encoder(input_ids=ag_input_ids,
-                                     attention_mask=ag_attention_mask).last_hidden_state
+            h_embs = self.ab_encoder(
+                input_ids=heavy_input_ids,
+                attention_mask=heavy_attention_mask
+            ).last_hidden_state  # (B, L_h, 768)
 
-        h_pooled = self.mean_pool(h_out, heavy_attention_mask)
-        l_pooled = self.mean_pool(l_out, light_attention_mask)
-        ab_pooled = torch.cat([h_pooled, l_pooled], dim=-1)
-        ag_pooled = self.mean_pool(ag_out, ag_attention_mask)
+            l_embs = self.ab_encoder(
+                input_ids=light_input_ids,
+                attention_mask=light_attention_mask
+            ).last_hidden_state  # (B, L_l, 768)
 
-        ab_proj = self.ab_proj(ab_pooled)
-        ag_proj = self.ag_proj(ag_pooled)
+            ag_embs = self.ag_encoder(
+                input_ids=ag_input_ids,
+                attention_mask=ag_attention_mask
+            ).last_hidden_state  # (B, L_ag, 640)
 
-        fused = torch.cat([ab_proj, ag_proj], dim=-1)
-        return self.mlp_head(fused).squeeze(-1)
+        # Dual-stream feature extraction (LEARNABLE)
+        h_fused = self.heavy_dualstream(h_embs, heavy_attention_mask)    # (B, 896)
+        l_fused = self.light_dualstream(l_embs, light_attention_mask)    # (B, 896)
+        ag_fused = self.ag_dualstream(ag_embs, ag_attention_mask)        # (B, 768)
+
+        # Inter-protein fusion
+        fused = torch.cat([h_fused, l_fused, ag_fused], dim=-1)  # (B, 2560)
+
+        # Regression
+        return self.mlp_head(fused).squeeze(-1)  # (B,)
