@@ -135,7 +135,7 @@ def main():
     print(f"🔑 NN Baseline Spearman ρ: {nn_rho:.4f}")
 
     # --- Training setup ---
-    NUM_EPOCHS = 50
+    NUM_EPOCHS = 10
     LR = 1e-4
     WEIGHT_DECAY = 1e-4
     MAX_GRAD_NORM = 1.0
@@ -144,7 +144,7 @@ def main():
     amp_scaler = torch.cuda.amp.GradScaler()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
 
-    start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, amp_scaler, CKPT_DIR)
+    start_epoch, best_spearman = load_latest_checkpoint(model, optimizer, amp_scaler, scheduler, CKPT_DIR)
 
     print(f"\n{'='*65}")
     print(f"  Starting training: epochs {start_epoch+1}→{NUM_EPOCHS}")
@@ -200,7 +200,7 @@ def main():
 
         # Log to CSV
         log_row = {"epoch": epoch + 1, "train_loss": avg_train_loss, **val_metrics}
-        write_header = not LOG_FILE.exists() or epoch == start_epoch
+        write_header = not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0
         with open(LOG_FILE, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=log_row.keys())
             if write_header:
@@ -213,9 +213,15 @@ def main():
               f"val_Spearman={val_metrics['spearman']:.4f} | "
               f"val_CI={val_metrics['ci']:.4f}")
 
-        if val_metrics["spearman"] > best_spearman:
+        is_best = val_metrics["spearman"] > best_spearman
+        if is_best:
             best_spearman = val_metrics["spearman"]
-            save_checkpoint(model, optimizer, amp_scaler, epoch + 1, best_spearman, CKPT_DIR)
+
+        save_checkpoint(
+            model, optimizer, amp_scaler, scheduler,
+            epoch + 1, val_metrics["spearman"], best_spearman,
+            CKPT_DIR, is_best=is_best
+        )
 
     print(f"\n✓ Training complete. Best validation Spearman ρ: {best_spearman:.4f}")
 

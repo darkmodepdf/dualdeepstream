@@ -68,37 +68,60 @@ def evaluate(model, loader, device, scaler=None):
     }, preds, targets, clusters
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, metric, ckpt_dir, max_ckpts=2):
-    ckpt_path = ckpt_dir / f"ckpt_epoch{epoch:03d}_spearman{metric:.4f}.pt"
-    torch.save({
+def save_checkpoint(model, optimizer, scaler, scheduler, epoch, metric, best_metric, ckpt_dir, is_best=False, max_best=2):
+    if not is_best:
+        return
+        
+    state = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_metric": metric,
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "best_metric": best_metric,
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state": torch.cuda.get_rng_state(),
-    }, ckpt_path)
-    existing = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)
-    while len(existing) > max_ckpts:
+        "numpy_rng_state": np.random.get_state(),
+    }
+    
+    best_path = ckpt_dir / f"ckpt_best_epoch{epoch:03d}_spearman{metric:.4f}.pt"
+    torch.save(state, best_path)
+    
+    existing = sorted(ckpt_dir.glob("ckpt_best_*.pt"), key=lambda p: p.stat().st_mtime)
+    while len(existing) > max_best:
         existing[0].unlink()
         existing.pop(0)
-    print(f"  💾 Saved checkpoint: {ckpt_path.name}")
+    print(f"  💾 Saved BEST checkpoint: {best_path.name}")
 
 
-def load_latest_checkpoint(model, optimizer, scaler, ckpt_dir):
-    ckpts = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)
+def load_latest_checkpoint(model, optimizer, scaler, scheduler, ckpt_dir):
+    ckpts = sorted(ckpt_dir.glob("ckpt_best_*.pt"), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        ckpts = sorted(ckpt_dir.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime)
+        
     if not ckpts:
         print("  No checkpoint found — starting from scratch")
         return 0, -float("inf")
+        
     ckpt_path = ckpts[-1]
     ckpt = torch.load(ckpt_path, map_location="cuda", weights_only=False)
+    
     model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None:
+    if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    if scaler is not None:
+    if scaler is not None and ckpt.get("scaler_state_dict") is not None:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-    torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
-    torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
-    print(f"  ✓ Resumed from {ckpt_path.name} (epoch {ckpt['epoch']})")
-    return ckpt["epoch"], ckpt["best_metric"]
+    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        
+    if "torch_rng_state" in ckpt:
+        torch.set_rng_state(ckpt["torch_rng_state"].cpu().byte())
+    if "cuda_rng_state" in ckpt:
+        torch.cuda.set_rng_state(ckpt["cuda_rng_state"].cpu().byte())
+    if "numpy_rng_state" in ckpt:
+        np.random.set_state(ckpt["numpy_rng_state"])
+        
+    epoch = ckpt["epoch"]
+    best_metric = ckpt.get("best_metric", -float("inf"))
+    print(f"  ✓ Resumed from {ckpt_path.name} (epoch {epoch})")
+    return epoch, best_metric
