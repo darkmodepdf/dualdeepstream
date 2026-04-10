@@ -1,14 +1,15 @@
 # Dataset
 AbRank_dataset.csv
-
+AbRank_dataset.csv:Zone.Identifier
 # Papers
 duadeep paper.txt
 duadeep paper.docx
-
+duadeep paper.docx:Zone.Identifier
+duadeep paper.txt:Zone.Identifier
 # Model Checkpoints and Logs
 checkpoints/
 training_log.csv
-
+*Zone.Identifier
 # MMseqs2 temporary files and output
 antigens.fasta
 ag_clusters*

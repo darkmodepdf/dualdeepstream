@@ -326,8 +326,6 @@ print(f"✓ WeightedRandomSampler: {len(train_weights):,} samples, upweighting {
 # %% [markdown]
 # ## §4 — Model: Dual Encoder + Projection + MLP Head
 
-# %%
-from transformers import AutoModel, AutoTokenizer, EsmModel, EsmTokenizer
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -432,8 +430,72 @@ print("✓ Tokenizers loaded")
 # ## §5 — Create DataLoaders
 
 # %%
-from dataset import AbAgAffinityDataset
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
+
+class AbAgAffinityDataset(Dataset):
+    """
+    Dataset for antibody-antigen binding affinity (pKd) prediction.
+
+    Each sample produces:
+      - heavy_input_ids, heavy_attention_mask   (AntiBERTa2-CSSP tokenized heavy chain)
+      - light_input_ids, light_attention_mask   (AntiBERTa2-CSSP tokenized light chain)
+      - ag_input_ids, ag_attention_mask          (ESM-2 tokenized antigen)
+      - target                                   (pKd float scalar)
+      - cluster_id                               (antigen cluster label, for stratification)
+    """
+
+    def __init__(self, df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512):
+        self.df = df.reset_index(drop=True)
+        self.ab_tokenizer = ab_tokenizer
+        self.ag_tokenizer = ag_tokenizer
+        self.max_ab_len = max_ab_len
+        self.max_ag_len = max_ag_len
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # --- Antibody: encode heavy and light chains SEPARATELY ---
+        heavy_tokens = self.ab_tokenizer(
+            row["Ab_heavy_chain_seq"],
+            max_length=self.max_ab_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        light_tokens = self.ab_tokenizer(
+            row["Ab_light_chain_seq"],
+            max_length=self.max_ab_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # --- Antigen ---
+        ag_tokens = self.ag_tokenizer(
+            row["Ag_seq"],
+            max_length=self.max_ag_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        target = torch.tensor(row["pKd"], dtype=torch.float32)
+        cluster_id = torch.tensor(row["ag_cluster_40"], dtype=torch.long)
+
+        return {
+            "heavy_input_ids": heavy_tokens["input_ids"].squeeze(0),
+            "heavy_attention_mask": heavy_tokens["attention_mask"].squeeze(0),
+            "light_input_ids": light_tokens["input_ids"].squeeze(0),
+            "light_attention_mask": light_tokens["attention_mask"].squeeze(0),
+            "ag_input_ids": ag_tokens["input_ids"].squeeze(0),
+            "ag_attention_mask": ag_tokens["attention_mask"].squeeze(0),
+            "target": target,
+            "cluster_id": cluster_id,
+        }
+
 
 train_dataset = AbAgAffinityDataset(train_df, ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
 val_dataset   = AbAgAffinityDataset(val_df,   ab_tokenizer, ag_tokenizer, max_ab_len=256, max_ag_len=512)
@@ -470,7 +532,7 @@ def compute_embeddings(model, loader, device):
     all_ab_embs, all_ag_embs, all_targets, all_clusters = [], [], [], []
     model.eval()
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Computing embeddings"):
+        for batch in tqdm(loader, desc="Computing embeddings", mininterval=2.0):
             h_ids = batch["heavy_input_ids"].to(device)
             h_mask = batch["heavy_attention_mask"].to(device)
             l_ids = batch["light_input_ids"].to(device)
@@ -552,7 +614,7 @@ print("Computing cosine similarities...")
 # Process in chunks to avoid OOM
 CHUNK = 1000
 nn_preds = np.zeros(len(test_embs))
-for i in tqdm(range(0, len(test_embs), CHUNK), desc="NN search"):
+for i in tqdm(range(0, len(test_embs), CHUNK), desc="NN search", mininterval=2.0):
     chunk = test_embs[i:i+CHUNK]
     sims = cosine_similarity(chunk, train_embs)
     nn_idx = sims.argmax(axis=1)
@@ -675,7 +737,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 
     epoch_loss = 0.0
     n_batches = 0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", mininterval=2.0)
     for batch in pbar:
         optimizer.zero_grad(set_to_none=True)
 
