@@ -24,18 +24,3 @@ The model architecture aims to learn both long-range protein fold patterns and f
 * High-Performance & Fault-Tolerant: Engineered for an NVIDIA A100 environment. Uses `torch.cuda.amp` for mixed precision, gradient clipping for stability, and persistent checkpoints (with RNG/Scheduler states saved) to resume training seamlessly upon server interruptions. 
 * Baseline-Driven Validation: The model's complex architecture must strictly outperform a pure Cosine-Similarity Nearest-Neighbor baseline on frozen PLM embeddings. If it doesn't beat the NN Spearman ρ, the deep learning model has failed to learn binding physics and is just doing sequence memorization.
 
-4. PROGRESS MADE
-----------------
-* Explored raw `AbRank_dataset.csv` and aligned the pipeline with the reference paper protocols.
-* Setup Conda environments fixing NumPy 2.x ABI incompatibility crashes and deprecated GPU memory attribute access.
-* Transitioned from a monolithic Jupyter format into a robust Modular Python repository codebase (`step1` through `step5`).
-* Conducted a rigorous codebase audit which identified and fixed two critical deviations from the paper:
-    - Missing dual-stream branches (model originally was just an embedding-concatenation MLP baseline).
-    - Missing pKd z-score standardization (which hurt MSE convergence).
-* Refactored checkpoint logic to explicitly track stateful objects (Numpy Random State, LR-Scheduler) and persist only the absolute best tracking models.
-
-5. IMMEDIATE NEXT STEPS
------------------------
-* Execute `step4_train.py` to initiate the training loop on the clustered benchmark data.
-* Monitor the training log metrics (Validation Spearman and RMSE) against the computed NN Baseline embeddings.
-* Proceed to `step5_evaluate.py` to deduce generalization capacity via the per-family calibration breakdown and plots.
